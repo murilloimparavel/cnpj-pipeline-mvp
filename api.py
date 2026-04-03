@@ -367,13 +367,23 @@ def export_estabelecimentos(
             with conn.cursor(name="csv_export") as cur:
                 cur.itersize = 2000
                 cur.execute(query, params)
+                # Fetch first batch to populate cur.description
+                first_batch = cur.fetchmany(2000)
+                if not first_batch:
+                    yield ""
+                    return
                 # header from cursor description
                 col_names = [desc[0] for desc in cur.description]
                 buf = io.StringIO()
                 writer = csv.writer(buf)
                 writer.writerow(col_names)
                 yield buf.getvalue()
-                # data in chunks
+                # yield first batch
+                buf = io.StringIO()
+                writer = csv.writer(buf)
+                writer.writerows(first_batch)
+                yield buf.getvalue()
+                # remaining data in chunks
                 while True:
                     rows = cur.fetchmany(2000)
                     if not rows:
