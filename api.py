@@ -1,55 +1,110 @@
 """CNPJ Pipeline API - Query Brazilian company data."""
 import csv
+import hmac
 import io
+import logging
 import os
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date
 from typing import Optional, List, Tuple
 
-from fastapi import FastAPI, HTTPException, Security, Query
+from fastapi import FastAPI, HTTPException, Request, Security, Query, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 import psycopg2
 import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
-app = FastAPI(title="CNPJ Pipeline API", version="2.0.0")
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-API_KEY = os.getenv("API_KEY", "cnpj-pipeline-default-key-2026")
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="CNPJ Pipeline API", version="3.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+API_KEY = os.environ["API_KEY"]
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 api_key_header = APIKeyHeader(name="X-API-Key")
 
 EXPORT_MAX_ROWS = 10_000
+CNAE_LIST_MAX = 20
+
+# ---------------------------------------------------------------------------
+# Connection Pool (AC1)
+# ---------------------------------------------------------------------------
+pool: ThreadedConnectionPool = None
 
 
+@app.on_event("startup")
+def _init_pool():
+    global pool
+    pool = ThreadedConnectionPool(
+        minconn=2,
+        maxconn=10,
+        dsn=DATABASE_URL,
+        options="-c statement_timeout=30000",
+    )
+    logger.info("Connection pool initialised (min=2, max=10, statement_timeout=30s)")
+
+
+@contextmanager
+def get_conn():
+    """Get a connection from the pool with automatic commit/rollback."""
+    conn = pool.getconn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.putconn(conn)
+
+
+# ---------------------------------------------------------------------------
+# Security (AC6)
+# ---------------------------------------------------------------------------
 def verify_key(key: str = Security(api_key_header)):
-    if key != API_KEY:
+    if not hmac.compare_digest(key, API_KEY):
         raise HTTPException(status_code=403, detail="Invalid API key")
     return key
 
 
-def get_db():
-    return psycopg2.connect(DATABASE_URL)
+# ---------------------------------------------------------------------------
+# DRY Filter Params (AC8)
+# ---------------------------------------------------------------------------
+@dataclass
+class FilterParams:
+    cnae: Optional[str] = Query(None, description="CNAE fiscal principal (ex: 7311400)")
+    uf: Optional[str] = Query(None, description="Estado (ex: SP, RJ)")
+    municipio: Optional[str] = Query(None, description="Codigo municipio IBGE")
+    com_email: bool = Query(False, description="Filtrar apenas com email")
+    situacao: str = Query("02", description="Situacao cadastral (02=Ativa)")
+    natureza_juridica: Optional[str] = Query(None, description="Codigo natureza juridica (ex: 2062=LTDA)")
+    capital_social_min: Optional[float] = Query(None, description="Capital social minimo", ge=0)
+    capital_social_max: Optional[float] = Query(None, description="Capital social maximo", ge=0)
+    porte: Optional[str] = Query(None, description="Porte da empresa (00, 01, 03, 05)")
+    com_telefone: bool = Query(False, description="Filtrar apenas com telefone")
+    cnae_list: Optional[str] = Query(None, description="Lista de CNAEs separados por virgula (ex: 7810800,7820500)")
+    razao_social: Optional[str] = Query(None, description="Busca textual na razao social (ILIKE)")
+    nome_fantasia: Optional[str] = Query(None, description="Busca textual no nome fantasia (ILIKE)")
+    data_inicio_min: Optional[date] = Query(None, description="Data inicio atividade minima (YYYY-MM-DD)")
+    data_inicio_max: Optional[date] = Query(None, description="Data inicio atividade maxima (YYYY-MM-DD)")
+    bairro: Optional[str] = Query(None, description="Bairro (exact match, uppercase)")
+    cidade: Optional[str] = Query(None, description="Nome da cidade (ILIKE search)")
 
 
-def build_filters(
-    cnae: Optional[str],
-    uf: Optional[str],
-    municipio: Optional[str],
-    com_email: bool,
-    situacao: Optional[str],
-    natureza_juridica: Optional[str],
-    capital_social_min: Optional[float],
-    capital_social_max: Optional[float],
-    porte: Optional[str],
-    com_telefone: bool,
-    cnae_list: Optional[str],
-    razao_social: Optional[str],
-    nome_fantasia: Optional[str],
-    data_inicio_min: Optional[date],
-    data_inicio_max: Optional[date],
-    bairro: Optional[str],
-    cidade: Optional[str],
-) -> Tuple[List[str], List, bool, bool]:
+# ---------------------------------------------------------------------------
+# Query builders
+# ---------------------------------------------------------------------------
+def build_filters(f: FilterParams) -> Tuple[List[str], List, bool, bool]:
     """Build WHERE conditions and params from filters.
 
     Returns (conditions, params, needs_emp_join, needs_mun_join).
@@ -60,67 +115,69 @@ def build_filters(
     needs_mun_join = False
 
     # -- estabelecimentos filters --
-    if cnae:
+    if f.cnae:
         conditions.append("e.cnae_fiscal_principal = %s")
-        params.append(cnae)
-    if cnae_list:
-        cnae_codes = [c.strip() for c in cnae_list.split(",") if c.strip()]
+        params.append(f.cnae)
+    if f.cnae_list:
+        cnae_codes = [c.strip() for c in f.cnae_list.split(",") if c.strip()]
+        if len(cnae_codes) > CNAE_LIST_MAX:
+            raise HTTPException(400, f"cnae_list max {CNAE_LIST_MAX} items, got {len(cnae_codes)}")
         if cnae_codes:
             placeholders = ", ".join(["%s"] * len(cnae_codes))
             conditions.append(f"e.cnae_fiscal_principal IN ({placeholders})")
             params.extend(cnae_codes)
-    if uf:
+    if f.uf:
         conditions.append("e.uf = %s")
-        params.append(uf.upper())
-    if municipio:
+        params.append(f.uf.upper())
+    if f.municipio:
         conditions.append("e.municipio = %s")
-        params.append(municipio)
-    if com_email:
+        params.append(f.municipio)
+    if f.com_email:
         conditions.append("e.correio_eletronico IS NOT NULL AND e.correio_eletronico != ''")
-    if com_telefone:
+    if f.com_telefone:
         conditions.append("e.telefone_1 IS NOT NULL AND e.telefone_1 != ''")
-    if situacao:
+    if f.situacao:
         conditions.append("e.situacao_cadastral = %s")
-        params.append(situacao)
-    if nome_fantasia:
+        params.append(f.situacao)
+    if f.nome_fantasia:
         conditions.append("e.nome_fantasia ILIKE %s")
-        params.append(f"%{nome_fantasia}%")
-    if bairro:
+        params.append(f"%{f.nome_fantasia}%")
+    if f.bairro:
         conditions.append("e.bairro = %s")
-        params.append(bairro.upper())
-    if data_inicio_min:
+        params.append(f.bairro.upper())
+    if f.data_inicio_min:
         conditions.append("e.data_inicio_atividade >= %s")
-        params.append(data_inicio_min)
-    if data_inicio_max:
+        params.append(f.data_inicio_min)
+    if f.data_inicio_max:
         conditions.append("e.data_inicio_atividade <= %s")
-        params.append(data_inicio_max)
+        params.append(f.data_inicio_max)
 
     # -- empresas filters (require JOIN) --
-    if natureza_juridica:
+    if f.natureza_juridica:
         conditions.append("emp.natureza_juridica = %s")
-        params.append(natureza_juridica)
+        params.append(f.natureza_juridica)
         needs_emp_join = True
-    if capital_social_min is not None:
+    if f.capital_social_min is not None:
         conditions.append("emp.capital_social >= %s")
-        params.append(capital_social_min)
+        params.append(f.capital_social_min)
         needs_emp_join = True
-    if capital_social_max is not None:
+    if f.capital_social_max is not None:
         conditions.append("emp.capital_social <= %s")
-        params.append(capital_social_max)
+        params.append(f.capital_social_max)
         needs_emp_join = True
-    if porte:
+    if f.porte:
         conditions.append("emp.porte = %s")
-        params.append(porte)
+        params.append(f.porte)
         needs_emp_join = True
-    if razao_social:
+    if f.razao_social:
         conditions.append("emp.razao_social ILIKE %s")
-        params.append(f"%{razao_social}%")
+        params.append(f"%{f.razao_social}%")
         needs_emp_join = True
 
     # -- municipios filter (require JOIN) --
-    if cidade:
+    if f.cidade:
         conditions.append("m.descricao ILIKE %s")
-        params.append(f"%{cidade}%")
+        params.append(f"%{f.cidade}%")
         needs_mun_join = True
 
     return conditions, params, needs_emp_join, needs_mun_join
@@ -165,44 +222,26 @@ SELECT_COLUMNS = """
             emp.porte"""
 
 
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 @app.get("/health")
-def health():
+@limiter.limit("30/minute")
+def health(request: Request):
     return {"status": "ok"}
 
 
 @app.get("/api/v1/estabelecimentos")
+@limiter.limit("30/minute")
 def search_estabelecimentos(
-    cnae: Optional[str] = Query(None, description="CNAE fiscal principal (ex: 7311400)"),
-    uf: Optional[str] = Query(None, description="Estado (ex: SP, RJ)"),
-    municipio: Optional[str] = Query(None, description="Codigo municipio IBGE"),
-    com_email: bool = Query(False, description="Filtrar apenas com email"),
-    situacao: str = Query("02", description="Situacao cadastral (02=Ativa)"),
-    natureza_juridica: Optional[str] = Query(None, description="Codigo natureza juridica (ex: 2062=LTDA)"),
-    capital_social_min: Optional[float] = Query(None, description="Capital social minimo", ge=0),
-    capital_social_max: Optional[float] = Query(None, description="Capital social maximo", ge=0),
-    porte: Optional[str] = Query(None, description="Porte da empresa (00, 01, 03, 05)"),
-    com_telefone: bool = Query(False, description="Filtrar apenas com telefone"),
-    cnae_list: Optional[str] = Query(None, description="Lista de CNAEs separados por virgula (ex: 7810800,7820500)"),
-    razao_social: Optional[str] = Query(None, description="Busca textual na razao social (ILIKE)"),
-    nome_fantasia: Optional[str] = Query(None, description="Busca textual no nome fantasia (ILIKE)"),
-    data_inicio_min: Optional[date] = Query(None, description="Data inicio atividade minima (YYYY-MM-DD)"),
-    data_inicio_max: Optional[date] = Query(None, description="Data inicio atividade maxima (YYYY-MM-DD)"),
-    bairro: Optional[str] = Query(None, description="Bairro (exact match, uppercase)"),
-    cidade: Optional[str] = Query(None, description="Nome da cidade (ILIKE search)"),
+    request: Request,
+    filters: FilterParams = Depends(),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     _: str = Security(verify_key),
 ):
     """Search establishments with advanced filters for prospecting."""
-    conditions, params, needs_emp, needs_mun = build_filters(
-        cnae=cnae, uf=uf, municipio=municipio, com_email=com_email,
-        situacao=situacao, natureza_juridica=natureza_juridica,
-        capital_social_min=capital_social_min, capital_social_max=capital_social_max,
-        porte=porte, com_telefone=com_telefone, cnae_list=cnae_list,
-        razao_social=razao_social, nome_fantasia=nome_fantasia,
-        data_inicio_min=data_inicio_min, data_inicio_max=data_inicio_max,
-        bairro=bairro, cidade=cidade,
-    )
+    conditions, params, needs_emp, needs_mun = build_filters(filters)
 
     if not conditions:
         raise HTTPException(400, "At least one filter required")
@@ -210,72 +249,71 @@ def search_estabelecimentos(
     where = " AND ".join(conditions)
     from_clause = build_from_clause(needs_emp, needs_mun)
 
-    # Count query
-    count_params = list(params)
-    count_query = f"SELECT COUNT(*) {from_clause} WHERE {where}"
+    # AC5: Use COUNT(*) OVER() window function to eliminate double scan
+    # Only compute total on first page (offset=0)
+    if offset == 0:
+        data_params = list(params)
+        data_params.extend([limit, offset])
+        query = f"""
+            SELECT {SELECT_COLUMNS},
+                   COUNT(*) OVER() AS _total_count
+            {from_clause}
+            WHERE {where}
+            ORDER BY emp.razao_social
+            LIMIT %s OFFSET %s
+        """
+    else:
+        data_params = list(params)
+        data_params.extend([limit, offset])
+        query = f"""
+            SELECT {SELECT_COLUMNS}
+            {from_clause}
+            WHERE {where}
+            ORDER BY emp.razao_social
+            LIMIT %s OFFSET %s
+        """
 
-    # Data query
-    data_params = list(params)
-    data_params.extend([limit, offset])
-
-    query = f"""
-        SELECT {SELECT_COLUMNS}
-        {from_clause}
-        WHERE {where}
-        ORDER BY emp.razao_social
-        LIMIT %s OFFSET %s
-    """
-
-    conn = get_db()
-    try:
+    t0 = time.monotonic()
+    with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(count_query, count_params)
-            total = cur.fetchone()["count"]
-
             cur.execute(query, data_params)
             rows = cur.fetchall()
 
-        return {
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "data": [dict(r) for r in rows],
-        }
-    finally:
-        conn.close()
+    elapsed = time.monotonic() - t0
+    if elapsed > 1.0:
+        logger.warning(
+            "Slow query (%.2fs): search_estabelecimentos filters=%s",
+            elapsed,
+            {k: v for k, v in filters.__dict__.items() if v},
+        )
+
+    if offset == 0 and rows:
+        total = rows[0]["_total_count"]
+        data = [{k: v for k, v in dict(r).items() if k != "_total_count"} for r in rows]
+    elif offset == 0:
+        total = 0
+        data = []
+    else:
+        total = -1  # not computed for offset > 0
+        data = [dict(r) for r in rows]
+
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "data": data,
+    }
 
 
 @app.get("/api/v1/estabelecimentos/count")
+@limiter.limit("30/minute")
 def count_estabelecimentos(
-    cnae: Optional[str] = Query(None, description="CNAE fiscal principal"),
-    uf: Optional[str] = Query(None, description="Estado (ex: SP, RJ)"),
-    municipio: Optional[str] = Query(None, description="Codigo municipio IBGE"),
-    com_email: bool = Query(False, description="Filtrar apenas com email"),
-    situacao: str = Query("02", description="Situacao cadastral (02=Ativa)"),
-    natureza_juridica: Optional[str] = Query(None, description="Codigo natureza juridica"),
-    capital_social_min: Optional[float] = Query(None, ge=0),
-    capital_social_max: Optional[float] = Query(None, ge=0),
-    porte: Optional[str] = Query(None, description="Porte da empresa"),
-    com_telefone: bool = Query(False, description="Filtrar apenas com telefone"),
-    cnae_list: Optional[str] = Query(None, description="Lista de CNAEs separados por virgula"),
-    razao_social: Optional[str] = Query(None, description="Busca textual na razao social"),
-    nome_fantasia: Optional[str] = Query(None, description="Busca textual no nome fantasia"),
-    data_inicio_min: Optional[date] = Query(None),
-    data_inicio_max: Optional[date] = Query(None),
-    bairro: Optional[str] = Query(None),
-    cidade: Optional[str] = Query(None, description="Nome da cidade (ILIKE)"),
+    request: Request,
+    filters: FilterParams = Depends(),
     _: str = Security(verify_key),
 ):
     """Count establishments matching filters (no data returned, faster)."""
-    conditions, params, needs_emp, needs_mun = build_filters(
-        cnae=cnae, uf=uf, municipio=municipio, com_email=com_email,
-        situacao=situacao, natureza_juridica=natureza_juridica,
-        capital_social_min=capital_social_min, capital_social_max=capital_social_max,
-        porte=porte, com_telefone=com_telefone, cnae_list=cnae_list,
-        razao_social=razao_social, nome_fantasia=nome_fantasia,
-        data_inicio_min=data_inicio_min, data_inicio_max=data_inicio_max,
-        bairro=bairro, cidade=cidade,
-    )
+    conditions, params, needs_emp, needs_mun = build_filters(filters)
 
     if not conditions:
         raise HTTPException(400, "At least one filter required")
@@ -284,47 +322,28 @@ def count_estabelecimentos(
     from_clause = build_from_clause(needs_emp, needs_mun)
     count_query = f"SELECT COUNT(*) {from_clause} WHERE {where}"
 
-    conn = get_db()
-    try:
+    t0 = time.monotonic()
+    with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(count_query, params)
             total = cur.fetchone()["count"]
-        return {"total": total}
-    finally:
-        conn.close()
+
+    elapsed = time.monotonic() - t0
+    if elapsed > 1.0:
+        logger.warning("Slow query (%.2fs): count_estabelecimentos", elapsed)
+
+    return {"total": total}
 
 
 @app.get("/api/v1/estabelecimentos/export")
+@limiter.limit("30/minute")
 def export_estabelecimentos(
-    cnae: Optional[str] = Query(None, description="CNAE fiscal principal"),
-    uf: Optional[str] = Query(None, description="Estado (ex: SP, RJ)"),
-    municipio: Optional[str] = Query(None, description="Codigo municipio IBGE"),
-    com_email: bool = Query(False, description="Filtrar apenas com email"),
-    situacao: str = Query("02", description="Situacao cadastral (02=Ativa)"),
-    natureza_juridica: Optional[str] = Query(None, description="Codigo natureza juridica"),
-    capital_social_min: Optional[float] = Query(None, ge=0),
-    capital_social_max: Optional[float] = Query(None, ge=0),
-    porte: Optional[str] = Query(None, description="Porte da empresa"),
-    com_telefone: bool = Query(False, description="Filtrar apenas com telefone"),
-    cnae_list: Optional[str] = Query(None, description="Lista de CNAEs separados por virgula"),
-    razao_social: Optional[str] = Query(None, description="Busca textual na razao social"),
-    nome_fantasia: Optional[str] = Query(None, description="Busca textual no nome fantasia"),
-    data_inicio_min: Optional[date] = Query(None),
-    data_inicio_max: Optional[date] = Query(None),
-    bairro: Optional[str] = Query(None),
-    cidade: Optional[str] = Query(None, description="Nome da cidade (ILIKE)"),
+    request: Request,
+    filters: FilterParams = Depends(),
     _: str = Security(verify_key),
 ):
-    """Export establishments as CSV (max 10,000 rows)."""
-    conditions, params, needs_emp, needs_mun = build_filters(
-        cnae=cnae, uf=uf, municipio=municipio, com_email=com_email,
-        situacao=situacao, natureza_juridica=natureza_juridica,
-        capital_social_min=capital_social_min, capital_social_max=capital_social_max,
-        porte=porte, com_telefone=com_telefone, cnae_list=cnae_list,
-        razao_social=razao_social, nome_fantasia=nome_fantasia,
-        data_inicio_min=data_inicio_min, data_inicio_max=data_inicio_max,
-        bairro=bairro, cidade=cidade,
-    )
+    """Export establishments as CSV (max 10,000 rows) using server-side cursor."""
+    conditions, params, needs_emp, needs_mun = build_filters(filters)
 
     if not conditions:
         raise HTTPException(400, "At least one filter required")
@@ -341,41 +360,47 @@ def export_estabelecimentos(
         LIMIT %s
     """
 
-    conn = get_db()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(query, params)
-            rows = cur.fetchall()
+    # AC4: Server-side cursor with streaming
+    def stream_csv():
+        conn = pool.getconn()
+        try:
+            with conn.cursor(name="csv_export") as cur:
+                cur.itersize = 2000
+                cur.execute(query, params)
+                # header from cursor description
+                col_names = [desc[0] for desc in cur.description]
+                buf = io.StringIO()
+                writer = csv.writer(buf)
+                writer.writerow(col_names)
+                yield buf.getvalue()
+                # data in chunks
+                while True:
+                    rows = cur.fetchmany(2000)
+                    if not rows:
+                        break
+                    buf = io.StringIO()
+                    writer = csv.writer(buf)
+                    writer.writerows(rows)
+                    yield buf.getvalue()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            logger.exception("Error during CSV export streaming")
+            raise
+        finally:
+            pool.putconn(conn)
 
-        def generate_csv():
-            output = io.StringIO()
-            if rows:
-                writer = csv.DictWriter(output, fieldnames=rows[0].keys())
-                writer.writeheader()
-                yield output.getvalue()
-                output.seek(0)
-                output.truncate(0)
-                for row in rows:
-                    writer.writerow(
-                        {k: (str(v) if v is not None else "") for k, v in dict(row).items()}
-                    )
-                    yield output.getvalue()
-                    output.seek(0)
-                    output.truncate(0)
-            else:
-                yield ""
-
-        return StreamingResponse(
-            generate_csv(),
-            media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=estabelecimentos.csv"},
-        )
-    finally:
-        conn.close()
+    return StreamingResponse(
+        stream_csv(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=estabelecimentos.csv"},
+    )
 
 
 @app.get("/api/v1/cnpj/{cnpj}")
+@limiter.limit("30/minute")
 def lookup_cnpj(
+    request: Request,
     cnpj: str,
     _: str = Security(verify_key),
 ):
@@ -384,6 +409,10 @@ def lookup_cnpj(
 
     if len(cnpj_clean) != 14:
         raise HTTPException(400, "CNPJ must have 14 digits")
+
+    # SEC-06: Validate CNPJ contains only digits
+    if not cnpj_clean.isdigit():
+        raise HTTPException(400, "CNPJ must contain only digits")
 
     cnpj_basico = cnpj_clean[:8]
     cnpj_ordem = cnpj_clean[8:12]
@@ -416,8 +445,8 @@ def lookup_cnpj(
         WHERE e.cnpj_basico = %s AND e.cnpj_ordem = %s AND e.cnpj_dv = %s
     """
 
-    conn = get_db()
-    try:
+    t0 = time.monotonic()
+    with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(query, (cnpj_basico, cnpj_ordem, cnpj_dv))
             row = cur.fetchone()
@@ -433,8 +462,10 @@ def lookup_cnpj(
             )
             socios = cur.fetchall()
 
-        result = dict(row)
-        result["socios"] = [dict(s) for s in socios]
-        return result
-    finally:
-        conn.close()
+    elapsed = time.monotonic() - t0
+    if elapsed > 1.0:
+        logger.warning("Slow query (%.2fs): lookup_cnpj cnpj=%s", elapsed, cnpj_basico)
+
+    result = dict(row)
+    result["socios"] = [dict(s) for s in socios]
+    return result

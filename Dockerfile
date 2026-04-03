@@ -11,15 +11,16 @@ COPY pyproject.toml .
 COPY config.py database.py downloader.py processor.py main.py api.py ./
 COPY entrypoint.sh .
 
-# Install dependencies + API deps
+# Install dependencies + API deps (including slowapi for rate limiting)
 RUN uv pip install --system -e . && \
-    uv pip install --system fastapi uvicorn psycopg2-binary
+    uv pip install --system fastapi uvicorn psycopg2-binary slowapi
 
 # Create temp directory
 RUN mkdir -p /app/temp
 
 # Setup monthly cron (day 5 at 3am)
-RUN echo "0 3 5 * * cd /app && python main.py >> /var/log/cnpj-pipeline.log 2>&1" > /etc/cron.d/cnpj-pipeline \
+# STAB-06: Use /etc/environment for cron env vars (set in entrypoint.sh)
+RUN echo "0 3 5 * * . /etc/environment && cd /app && python main.py >> /var/log/cnpj-pipeline.log 2>&1" > /etc/cron.d/cnpj-pipeline \
     && chmod 0644 /etc/cron.d/cnpj-pipeline \
     && crontab /etc/cron.d/cnpj-pipeline
 

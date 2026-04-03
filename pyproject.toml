@@ -1,6 +1,6 @@
 [project]
 name = "cnpj-data-pipeline"
-version = "1.3.2"
+version = "1.4.0"
 requires-python = ">=3.11"
 dependencies = [
     "psycopg2-binary>=2.9.9",
@@ -8,6 +8,13 @@ dependencies = [
     "tqdm>=4.66.0",
     "python-dotenv>=1.0.0",
     "polars>=1.0.0",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+    "slowapi>=0.1.9",
 ]
 
 [project.scripts]

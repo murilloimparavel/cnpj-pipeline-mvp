@@ -3,19 +3,18 @@ set -e
 
 echo "$(date) - CNPJ Pipeline starting..."
 
+# STAB-06: Export env vars for cron jobs
+env >> /etc/environment
+
 # Start cron daemon in background (for monthly updates)
 cron
 
-# Start API server in background
-echo "$(date) - Starting API server on port 8000..."
-uvicorn api:app --host 0.0.0.0 --port 8000 --log-level info &
-
-# Run initial pipeline (first load)
+# STAB-07: Use exec so uvicorn receives signals (SIGTERM, SIGINT) directly
+# Run initial pipeline first, then hand off PID 1 to uvicorn
 echo "$(date) - Running initial data load..."
-python main.py 2>&1 | tee /var/log/cnpj-pipeline.log
+python main.py 2>&1 | tee /var/log/cnpj-pipeline.log || true
 
 echo "$(date) - Initial load complete. Cron scheduled for day 5 of each month at 3am."
-echo "$(date) - API running on port 8000. Container staying alive..."
+echo "$(date) - Starting API server on port 8000..."
 
-# Keep container running
-wait
+exec uvicorn api:app --host 0.0.0.0 --port 8000 --log-level info

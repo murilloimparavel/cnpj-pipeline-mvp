@@ -9,7 +9,7 @@ import polars as pl
 
 logger = logging.getLogger(__name__)
 
-# File pattern → table name mapping
+# File pattern -> table name mapping
 FILE_MAPPINGS = {
     "CNAECSV": "cnaes",
     "MOTICSV": "motivos",
@@ -113,7 +113,10 @@ def get_file_type(filename: str) -> Optional[str]:
 
 def _convert_encoding(file_path: Path) -> Path:
     """Convert ISO-8859-1 to UTF-8. Returns path to converted file."""
-    utf8_file = Path(tempfile.mktemp(suffix=".utf8.csv"))
+    # STAB-05: Use NamedTemporaryFile instead of mktemp (race condition)
+    tmp = tempfile.NamedTemporaryFile(suffix=".utf8.csv", delete=False)
+    utf8_file = Path(tmp.name)
+    tmp.close()
     with open(file_path, "r", encoding="ISO-8859-1") as infile:
         with open(utf8_file, "w", encoding="UTF-8") as outfile:
             for chunk in iter(lambda: infile.read(50 * 1024 * 1024), ""):  # 50MB chunks
@@ -173,11 +176,11 @@ def process_file(
 def _transform(df: pl.DataFrame, file_type: str) -> pl.DataFrame:
     """Apply transformations based on file type."""
 
-    # Capital social: "1.234,56" → "1234.56"
+    # Capital social: "1.234,56" -> "1234.56"
     if file_type == "EMPRECSV" and "capital_social" in df.columns:
         df = df.with_columns(pl.col("capital_social").str.replace_all(r"\.", "").str.replace(",", "."))
 
-    # Date columns: "0" or "00000000" → null
+    # Date columns: "0" or "00000000" -> null
     date_cols = {
         "ESTABELE": ["data_situacao_cadastral", "data_inicio_atividade", "data_situacao_especial"],
         "SIMPLESCSV": [

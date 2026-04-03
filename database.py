@@ -8,8 +8,16 @@ from urllib.parse import urlparse
 
 import polars as pl
 import psycopg2
+from psycopg2 import sql
 
 logger = logging.getLogger(__name__)
+
+# SEC-03: Allowlist of valid tables for bulk_upsert
+ALLOWED_TABLES = {
+    "cnaes", "motivos", "municipios", "naturezas_juridicas",
+    "paises", "qualificacoes_socios", "empresas",
+    "estabelecimentos", "socios", "dados_simples",
+}
 
 
 class Database:
@@ -63,8 +71,14 @@ class Database:
                     (directory,),
                 )
                 return {row[0] for row in cur.fetchall()}
-        except Exception:
+        except psycopg2.ProgrammingError:
+            # Table may not exist yet on first run
+            logger.warning("processed_files table not found, returning empty set")
             return set()
+        except Exception:
+            # STAB-03: Log and re-raise instead of silently returning empty set
+            logger.exception("Error fetching processed files for directory=%s", directory)
+            raise
 
     def mark_processed(self, directory: str, filename: str):
         """Mark a file as processed."""
@@ -93,15 +107,21 @@ class Database:
         if df.is_empty():
             return
 
+        # SEC-03: Validate table name against allowlist
+        if table_name not in ALLOWED_TABLES:
+            raise ValueError(f"Invalid table: {table_name}")
+
         self.connect()
         temp_table = f"temp_{table_name}_{id(df)}"
 
         try:
             with self.conn.cursor() as cur:
-                # 1. Create temp table
+                # 1. Create temp table — use sql.Identifier for table names
                 cur.execute(
-                    f"CREATE TEMP TABLE {temp_table} "
-                    f"(LIKE {table_name} INCLUDING DEFAULTS INCLUDING STORAGE) ON COMMIT DROP"
+                    sql.SQL("CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS INCLUDING STORAGE) ON COMMIT DROP").format(
+                        sql.Identifier(temp_table),
+                        sql.Identifier(table_name),
+                    )
                 )
 
                 # 2. COPY to temp
@@ -120,14 +140,15 @@ class Database:
 
     def _copy_to_temp(self, cur, df: pl.DataFrame, temp_table: str, columns: List[str]):
         """COPY DataFrame to temp table using Polars CSV."""
-        columns_str = ", ".join([f'"{col}"' for col in columns])
+        columns_sql = sql.SQL(", ").join([sql.Identifier(col) for col in columns])
+        copy_stmt = sql.SQL("COPY {} ({}) FROM STDIN WITH CSV ENCODING 'UTF8'").format(
+            sql.Identifier(temp_table),
+            columns_sql,
+        )
         csv_bytes = df.write_csv(include_header=False).encode("utf-8", errors="replace")
         csv_bytes = csv_bytes.replace(b"\x00", b"")
 
-        cur.copy_expert(
-            f"COPY {temp_table} ({columns_str}) FROM STDIN WITH CSV ENCODING 'UTF8'",
-            io.BytesIO(csv_bytes),
-        )
+        cur.copy_expert(copy_stmt.as_string(cur.connection), io.BytesIO(csv_bytes))
 
     def _get_primary_keys(self, cur, table_name: str) -> List[str]:
         """Get primary key columns for a table with caching."""
@@ -151,17 +172,28 @@ class Database:
 
     def _upsert_from_temp(self, cur, temp_table: str, target_table: str, columns: List[str], primary_keys: List[str]):
         """Upsert from temp to target table."""
-        columns_str = ", ".join([f'"{col}"' for col in columns])
-        pk_str = ", ".join([f'"{pk}"' for pk in primary_keys])
+        cols = sql.SQL(", ").join([sql.Identifier(c) for c in columns])
+        pks = sql.SQL(", ").join([sql.Identifier(pk) for pk in primary_keys])
 
         update_cols = [c for c in columns if c not in primary_keys]
-        update_clause = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
-        if update_clause:
-            update_clause += ", data_atualizacao = CURRENT_TIMESTAMP"
+        if update_cols:
+            update_clause = sql.SQL(", ").join([
+                sql.SQL("{col} = EXCLUDED.{col}").format(col=sql.Identifier(c))
+                for c in update_cols
+            ]) + sql.SQL(", data_atualizacao = CURRENT_TIMESTAMP")
+            conflict_action = sql.SQL("DO UPDATE SET ") + update_clause
+        else:
+            conflict_action = sql.SQL("DO NOTHING")
 
-        sql = f"""
-            INSERT INTO {target_table} ({columns_str})
-            SELECT DISTINCT ON ({pk_str}) {columns_str} FROM {temp_table} ORDER BY {pk_str}
-            ON CONFLICT ({pk_str}) {"DO UPDATE SET " + update_clause if update_clause else "DO NOTHING"}
-        """
-        cur.execute(sql)
+        stmt = sql.SQL(
+            "INSERT INTO {target} ({cols}) "
+            "SELECT DISTINCT ON ({pks}) {cols} FROM {temp} ORDER BY {pks} "
+            "ON CONFLICT ({pks}) {action}"
+        ).format(
+            target=sql.Identifier(target_table),
+            cols=cols,
+            pks=pks,
+            temp=sql.Identifier(temp_table),
+            action=conflict_action,
+        )
+        cur.execute(stmt)
